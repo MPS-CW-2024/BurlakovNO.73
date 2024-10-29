@@ -1,0 +1,221 @@
+#define F_CPU 8000000UL
+#include <avr/io.h>      
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdio.h>
+
+/* Определение пинов для LCD */
+#define LCD_Data_Dir DDRB
+#define LCD_Command_Dir DDRC
+#define LCD_Data_Port PORTB
+#define LCD_Command_Port PORTC
+#define RS PC0               /* Register Select */
+#define RW PC1               /* Read/Write */
+#define EN PC2               /* Enable */
+
+/* Определение пинов для Зуммера */
+#define BUZZER PA3
+
+/* Определение номиналов монет */
+#define NOMINAL1 1   // Датчик 1
+#define NOMINAL2 2   // Датчик 2
+#define NOMINAL3 5   // Датчик 3
+#define NOMINAL4 10  // Датчик 4
+#define NOMINAL5 0  // Датчик 5
+
+/* Глобальные переменные для подсчёта монет */
+volatile uint16_t count1 = 0;
+volatile uint16_t count2 = 0;
+volatile uint16_t count3 = 0;
+volatile uint16_t count4 = 0;
+volatile uint16_t count5 = 0;
+
+/* Функции USART */
+void USART_Init(unsigned int baud) {
+    /* Настройка скорости передачи */
+    unsigned int ubrr = F_CPU/16/baud-1;
+    UBRRH = (unsigned char)(ubrr>>8);
+    UBRRL = (unsigned char)ubrr;
+    /* Включение приёмника и передатчика */
+    UCSRB = (1<<RXEN) | (1<<TXEN);
+    /* Настройка формата кадра: 8 бит данных, 1 стоп-бит */
+    UCSRC = (1<<URSEL) | (3<<UCSZ0);
+}
+
+void USART_Transmit(unsigned char data) {
+    /* Ожидание готовности буфера передатчика */
+    while (!(UCSRA & (1<<UDRE)));
+    UDR = data;
+}
+
+void USART_SendString(const char* str) {
+    while(*str) {
+        USART_Transmit(*str++);
+    }
+}
+
+/* Инициализация внешних прерываний */
+void External_Interrupts_Init() {
+    /* Настройка INT0 (PD2) и INT1 (PD3) на спадающий фронт */
+    MCUCR |= (1 << ISC01) | (1 << ISC11);
+    /* Разрешение прерываний INT0 и INT1 */
+    GICR |= (1 << INT0) | (1 << INT1);
+}
+
+/* Обработчик прерывания INT0_vect */
+ISR(INT0_vect) {
+    count1++;
+}
+
+/* Обработчик прерывания INT1_vect */
+ISR(INT1_vect) {
+    count2++;
+}
+
+/* Функция отправки команды на LCD */
+void LCD_Command(unsigned char cmnd) {
+    LCD_Data_Port = cmnd;
+    LCD_Command_Port &= ~(1 << RS);   /* RS = 0 для команды */
+    LCD_Command_Port &= ~(1 << RW);   /* RW = 0 для записи */
+    LCD_Command_Port |= (1 << EN);    /* Импульс E */
+    _delay_us(1);
+    LCD_Command_Port &= ~(1 << EN);
+    _delay_ms(3);
+}
+
+/* Функция отправки данных на LCD */
+void LCD_Char(unsigned char char_data) {
+    LCD_Data_Port = char_data;
+    LCD_Command_Port |= (1 << RS);    /* RS = 1 для данных */
+    LCD_Command_Port &= ~(1 << RW);   /* RW = 0 для записи */
+    LCD_Command_Port |= (1 << EN);    /* Импульс E */
+    _delay_us(1);
+    LCD_Command_Port &= ~(1 << EN);
+    _delay_ms(1);
+}
+
+/* Инициализация LCD */
+void LCD_Init(void) {
+    LCD_Command_Dir = 0xFF;   /* Настройка порта команд как выход */
+    LCD_Data_Dir = 0xFF;      /* Настройка порта данных как выход */
+    _delay_ms(20);             /* Задержка для инициализации питания */
+    
+    LCD_Command(0x38);        /* Инициализация 16x2 LCD в 8-битном режиме */
+    LCD_Command(0x0C);        /* Включение дисплея, курсор выключен */
+    LCD_Command(0x06);        /* Автоинкремент курсора */
+    LCD_Command(0x01);        /* Очистка дисплея */
+    LCD_Command(0x80);        /* Установка курсора в начало первой строки */
+}
+
+/* Функция вывода строки на LCD */
+void LCD_String(char *str) {
+    int i;
+    for(i = 0; str[i] != 0; i++) {  /* Отправка каждого символа до NULL */
+        LCD_Char(str[i]);
+    }
+}
+
+/* Функция установки курсора на определённую позицию и вывода строки */
+void LCD_String_xy(char row, char pos, char *str) {
+    if (row == 0 && pos < 16)
+        LCD_Command((pos & 0x0F) | 0x80);  /* Первая строка */
+    else if (row == 1 && pos < 16)
+        LCD_Command((pos & 0x0F) | 0xC0);  /* Вторая строка */
+    LCD_String(str);
+}
+
+/* Функция очистки LCD */
+void LCD_Clear() {
+    LCD_Command(0x01);    /* Очистка дисплея */
+    LCD_Command(0x80);    /* Установка курсора в начало первой строки */
+}
+
+/* Функция отображения подсчётов на LCD, вывода через USART и активации зуммера */
+void Display_Counts(void) {
+    /* Вычисление суммы */
+    uint32_t total_sum = (count1 * NOMINAL1) + (count2 * NOMINAL2) + (count3 * NOMINAL3) + 
+                          (count4 * NOMINAL4) + (count5 * NOMINAL5);
+    
+    /* Формирование строк для отображения */
+    char buffer1[16];
+    char buffer2[16];
+    sprintf(buffer1, "1:%d 2:%d 5:%d", count1, count2, count3);
+    sprintf(buffer2, "10:%d X:%d Sum:%ld", count4, count5, total_sum);
+    
+    /* Очистка дисплея и вывод данных */
+    LCD_Clear();
+    LCD_String(buffer1);
+    LCD_Command(0xC0);    /* Переход на вторую строку */
+    LCD_String(buffer2);
+    
+    /* Подготовка строки для отправки через USART */
+    char usart_buffer[50];
+    sprintf(usart_buffer, "Counts: 1:%d 2:%d 5:%d 10:%d X:%d Sum:%ld\r\n", 
+            count1, count2, count3, count4, count5, total_sum);
+    
+    /* Отправка данных через USART */
+    USART_SendString(usart_buffer);
+    
+    /* Активация зуммера */
+    PORTA |= (1 << BUZZER);    /* Включение баззера */
+    _delay_ms(500);             /* Задержка для звука */
+    PORTA &= ~(1 << BUZZER);   /* Выключение баззера */
+}
+
+int main(void) {
+    /* Настройка пинов */
+    DDRB = 0xFF;             /* Порт B как выход для данных LCD */
+    DDRC = 0xFF;             /* Порт C как выход для команд LCD */
+    DDRA |= (1 << BUZZER);   /* Настройка PA3 как выход для зуммера */
+    PORTA &= ~(1 << BUZZER); /* Выключение зуммера в начале */
+    
+    /* Настройка входов для датчиков и кнопки */
+    DDRA &= ~((1 << PA0) | (1 << PA1) | (1 << PA2) | (1 << PA7)); /* PA0, PA1, PA2, PA7 как входы */
+    PORTA |= (1 << PA0) | (1 << PA1) | (1 << PA2) | (1 << PA7);   /* Включение подтягивающих резисторов */
+    
+    /* Инициализация LCD и внешних прерываний */
+    LCD_Init();
+    External_Interrupts_Init();
+    
+    /* Инициализация USART (9600 бод) */
+    USART_Init(9600);
+    
+    /* Разрешение глобальных прерываний */
+    sei();
+    
+    /* Инициализация отображения */
+    LCD_String("Press the button"); /* Вывод первой строки */
+    LCD_Command(0xC0);              /* Переход на вторую строку */
+    LCD_String("To count");      /* Вывод второй строки */
+    
+    while(1) {
+        /* Проверка нажатия кнопки на PA7 */
+        if (!(PINA & (1 << PA7))) {   /* Если кнопка нажата*/
+            _delay_ms(50);             /* Антидребезг */
+            if (!(PINA & (1 << PA7))) { /* Проверка снова для подтверждения */
+                Display_Counts();      /* Отображение подсчётов на LCD, отправка через USART и включение баззера */
+                
+                /* Антибребезг после нажатия */
+                _delay_ms(200);
+            }
+        }
+        
+        /* Обработка датчиков 3, 4 и 5*/
+        if (!(PINA & (1 << PA0))) { /* Датчик 3 */
+            count3++;
+            _delay_ms(500); /* Антидребезг */
+        }
+        
+        if (!(PINA & (1 << PA1))) { /* Датчик 4 */
+            count4++;
+            _delay_ms(500); /* Антидребезг */
+        }
+        
+        if (!(PINA & (1 << PA2))) { /* Датчик 5 */
+            count5++;
+            _delay_ms(500); /* Антидребезг */
+        }
+    }
+    
+    return 0;
+}
